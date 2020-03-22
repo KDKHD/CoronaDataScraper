@@ -5,6 +5,8 @@ countryDict = {
     "DRC":"CD",
     "IVORY-COAST": "CI",
     "VINCENT-GRENADINES": "VC",
+    "SOUTH-KOREA":"KR",
+    "CHINA-HONG-KONG-SAR":"HK",
     "UK": "GB",
     "AFGHANISTAN":"AF",
     "ÅLAND ISLANDS":"AX",

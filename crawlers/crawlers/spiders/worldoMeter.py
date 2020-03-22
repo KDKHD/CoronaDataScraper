@@ -8,6 +8,7 @@ import hashlib
 from ..connections.elasticSearch import elasticSearchApi
 import pycountry
 import countryCodes
+from dateutil import parser
 class worldMeter(scrapy.Spider):
     name = "worldMeter"
 
@@ -58,19 +59,15 @@ class worldMeter(scrapy.Spider):
             rowData = self.parseRow(row)
             dataHash = hashlib.md5(json.dumps(rowData, sort_keys = True).encode("utf-8")).hexdigest()
             rowData["time"] = datetime.now()
+            try:
+                rowData["url"] = rowData["country"]["url"]
+            except Exception as e:
+                pass
             rowData["country"] = "{}".format(rowData["country"]["value"].lower().split(".")[-1].strip().replace(" ","-"))
             if "total" in rowData["country"]:
                 continue
-            try:
-                if rowData["country"].upper() in countryCodes.countryDict:
-                    rowData["alpha2"] = countryCodes.countryDict[rowData["country"].upper()]
-                else:
-                    rowData["alpha2"]= pycountry.countries.search_fuzzy(rowData["country"].replace("-", " "))[0].alpha_2
-            except Exception as e:
-                try:
-                    rowData["alpha2"]= pycountry.countries.search_fuzzy(rowData["country"])[0].alpha_2
-                except Exception as e:
-                    print(rowData["country"].upper())
+
+            rowData["alpha2"] = self.getCountryCode(rowData["country"])
             self.es.store_data(rowData, index = "corona_daily_worldometer_table", doc_id = dataHash)
             tableData.append(rowData)
         return tableData
@@ -102,10 +99,9 @@ class worldMeter(scrapy.Spider):
     def getCountryUrls(self, tableData):
         countryLinks = []
         for row in tableData:
-            countryCol = row["country"]
             try:
-                if countryCol["url"] != "":
-                    countryLinks.append(countryCol["url"])
+                if "url" in row:
+                    countryLinks.append(row["url"])
             except Exception as e:
                 pass
         return countryLinks
@@ -114,12 +110,7 @@ class worldMeter(scrapy.Spider):
         country = response.url.strip("/").split("/")[-1]
 
         # extract script tag -> Highcharts containing the data
-        scriptData = response.css(
-            ".col-md-12")[0].css("script[type='text/javascript']").extract_first()
-        start = "Highcharts.chart('coronavirus-cases-linear',"
-        end = ";"
-        graphScriptTag = scriptData[scriptData.find(
-            start):scriptData.find(end)]
+        graphScriptTag = self.getChartScript(response, 0, "coronavirus-cases-linear")
 
         # extract categories
         catStart = graphScriptTag[graphScriptTag.find("categories:"):]
@@ -127,12 +118,68 @@ class worldMeter(scrapy.Spider):
         categories = categories.replace("categories", '"categories"')
         categories = json.loads("{"+categories+"}")
 
-        # extract data
-        dataStart = graphScriptTag[graphScriptTag.find("data:"):]
-        data = dataStart[:dataStart.find("}")]
-        data = data.replace("data", '"data"')
-        data = json.loads("{"+data+"}")
+        # extract totalData
+        totalDataStart = graphScriptTag[graphScriptTag.find("data:"):]
+        totalData = self.extractDataFromScript(totalDataStart)
+
+        graphScriptTag = self.getChartScript(response, 1, "graph-cases-daily")
+        totalNew = self.extractDataFromScript(graphScriptTag)
+
+        graphScriptTag = self.getChartScript(response, 2, "graph-active-cases-total")
+        totalInfected = self.extractDataFromScript(graphScriptTag)
+
+        graphScriptTag = self.getChartScript(response, 3, "coronavirus-deaths-linear")
+        totalDeaths = self.extractDataFromScript(graphScriptTag)
+
+        graphScriptTag = self.getChartScript(response, 4, "graph-deaths-daily")
+        totalNewDeaths = self.extractDataFromScript(graphScriptTag)
+
 
         # merge categories and data
-        graphData = dict(zip(categories["categories"], data["data"]))
+        graphData = zip(totalData["data"], totalNew["data"], totalInfected["data"], totalDeaths["data"], totalNewDeaths["data"])
+
+        graphData = dict(zip(categories["categories"], graphData))
+        for key in graphData:
+            data = {
+                "country": country,
+                "alpha2":self.getCountryCode(country),
+                "date":key,
+                "totalCases": int(graphData[key][0]) if graphData[key][1] != None else 0,
+                "totalNewCases": int(graphData[key][1]) if graphData[key][1] != None else 0,
+                "totalInfected": int(graphData[key][2]) if graphData[key][1] != None else 0,
+                "totalDeaths": int(graphData[key][3]) if graphData[key][1] != None else 0,
+                "totalNewDeaths": int(graphData[key][4]) if graphData[key][1] != None else 0,
+            }
+            dataHash = hashlib.md5(json.dumps(data, sort_keys = True).encode("utf-8")).hexdigest()
+            data["date"] = parser.parse(data["date"])
+            self.es.store_data(data, index = "corona_country_worldometer_past", doc_id = dataHash)
+
         self.graphDataContries[country] = graphData
+
+    def getChartScript(self, response, index, tableName):
+        scriptData = response.css(".col-md-12")[index].css("script[type='text/javascript']").extract_first()
+        start = "Highcharts.chart('{}',".format(tableName)
+        end = ";"
+        graphScriptTag = scriptData[scriptData.find(start):scriptData.find(end)]
+        return graphScriptTag
+
+    def extractDataFromScript(self, script):
+        scriptStart = script[script.find("data:"):]
+        content = scriptStart[:scriptStart.find("}")]
+        content = content.replace("data", '"data"')
+        content = json.loads("{"+content+"}")
+        return content
+
+
+    def getCountryCode(self, country):
+        try:
+            if country.upper() in countryCodes.countryDict:
+                return countryCodes.countryDict[country.upper()]
+            else:
+                return pycountry.countries.search_fuzzy(country.replace("-", " "))[0].alpha_2
+        except Exception as e:
+            try:
+                return pycountry.countries.search_fuzzy(country)[0].alpha_2
+            except Exception as e:
+                print(country.upper())
+        return ""
