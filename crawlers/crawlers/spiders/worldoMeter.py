@@ -2,9 +2,12 @@ import scrapy
 from scrapy.loader import ItemLoader
 from scrapy import signals
 from datetime import datetime
+import time
 import json
-
-
+import hashlib
+from ..connections.elasticSearch import elasticSearchApi
+import pycountry
+import countryCodes
 class worldMeter(scrapy.Spider):
     name = "worldMeter"
 
@@ -14,6 +17,13 @@ class worldMeter(scrapy.Spider):
 
     graphDataContries = {}
     tableData = {}
+    es = None
+
+    def __init__(self):
+        try:
+            self.es = elasticSearchApi.es()
+        except Exception as e:
+            quit()
 
     @classmethod
     def from_crawler(cls, crawler, *args, **kwargs):
@@ -23,6 +33,7 @@ class worldMeter(scrapy.Spider):
         return spider
 
     def spider_closed(self, spider):
+        return
         # do whatever with the data at the end, write to file
         currentTime = str(datetime.now()).split(".")[0]
         with open('graphDataContries_{}.json'.format(currentTime), 'w') as outfile:
@@ -45,6 +56,22 @@ class worldMeter(scrapy.Spider):
         tableData = []
         for row in rows:
             rowData = self.parseRow(row)
+            dataHash = hashlib.md5(json.dumps(rowData, sort_keys = True).encode("utf-8")).hexdigest()
+            rowData["time"] = datetime.now()
+            rowData["country"] = "{}".format(rowData["country"]["value"].lower().split(".")[-1].strip().replace(" ","-"))
+            if "total" in rowData["country"]:
+                continue
+            try:
+                if rowData["country"].upper() in countryCodes.countryDict:
+                    rowData["alpha2"] = countryCodes.countryDict[rowData["country"].upper()]
+                else:
+                    rowData["alpha2"]= pycountry.countries.search_fuzzy(rowData["country"].replace("-", " "))[0].alpha_2
+            except Exception as e:
+                try:
+                    rowData["alpha2"]= pycountry.countries.search_fuzzy(rowData["country"])[0].alpha_2
+                except Exception as e:
+                    print(rowData["country"].upper())
+            self.es.store_data(rowData, index = "corona_daily_worldometer_table", doc_id = dataHash)
             tableData.append(rowData)
         return tableData
 
@@ -52,7 +79,10 @@ class worldMeter(scrapy.Spider):
         rowData = []
         for col in row.css("td"):
             data, url = self.parseCol(col)
-            rowData.append(dict(zip(["value", "url"], [data, url])))
+            if url != "":
+                rowData.append(dict(zip(["value", "url"], [data, url])))
+            else:
+                rowData.append(dict(zip(["value"], [data])))
         keys = ["country", "totalCases", "newCases", "totalDeaths",
                 "newDeaths", "totalRecovered", "activeCases", "seriousCasesrows"]
         rowDict = dict(zip(keys, rowData))
@@ -63,14 +93,21 @@ class worldMeter(scrapy.Spider):
         urlRaw = col.css("a ::attr(href)").extract_first()
         url = urlRaw.strip() if urlRaw != None else ""
         data = dataRaw.strip() if dataRaw != None else ""
+        try:
+            data = int(data.replace(",",""))
+        except ValueError:
+            pass
         return (["", url] if data == None else [data, url])
 
     def getCountryUrls(self, tableData):
         countryLinks = []
         for row in tableData:
             countryCol = row["country"]
-            if countryCol["url"] != "":
-                countryLinks.append(countryCol["url"])
+            try:
+                if countryCol["url"] != "":
+                    countryLinks.append(countryCol["url"])
+            except Exception as e:
+                pass
         return countryLinks
 
     def parseCountryPage(self, response):
